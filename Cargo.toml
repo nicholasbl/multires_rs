@@ -1,0 +1,21 @@
+[package]
+name = "multires_rs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4", features = ["derive"] }
+glam = { version = "0.33", features = ["bytemuck"] }
+memmap2 = "0.9"
+meshopt = "0.6"
+rayon = "1.10"
+rkyv = { version = "0.8", features = [
+    "bytecheck",
+    "pointer_width_64",
+    "std",
+    "little_endian",
+    "alloc",
+] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.9"
