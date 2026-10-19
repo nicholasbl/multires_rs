@@ -74,10 +74,14 @@ fn mutable_workflow_invalidates_acceleration_and_round_trips() {
             .is_none()
     );
 
-    dataset.rebuild_acceleration().unwrap();
     let mut bytes = Vec::new();
     write_msg(&dataset, &MsgWriteOptions::default(), &mut bytes).unwrap();
     let decoded = read_msg(&bytes).unwrap();
+    assert!(
+        decoded.field("density").unwrap().levels()[0]
+            .acceleration()
+            .is_some()
+    );
     assert_eq!(
         decoded.field("density").unwrap().levels()[0]
             .values()

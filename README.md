@@ -1,11 +1,12 @@
 # multires_rs
 
-`multires_rs` is an implementation of multiresolution sparse grids (MSG), including the
+`multires_rs` is an implementation of multiresolution sparse grids
+(MSG (I was hungry when I wrote this)), including the
 `.msg` archive format, and algorithms that operate on MSG data. Source-format importers such as
 `amrex_rs` and `msg_vti` depend on this crate.
 
 An MSG file currently contains one timestep. Levels are ordered coarse to fine,
-all fields are finite scalar point data, and every field owns its sparse
+all fields are finite scalar point data, and every field has its own unique sparse
 topology. Missing points mean “not present,” not zero. If you wish to store a “background”
 value, you must do so explicitly.
 
@@ -53,7 +54,8 @@ fn main() -> anyhow::Result<()> {
         vec![MsgFieldLevel::new(density)],
     ))?;
 
-    // Optional, but useful before isosurface extraction or archive writing.
+    // Optional for in-memory isosurface extraction. Archive writing always
+    // derives fresh acceleration from the current samples.
     dataset.rebuild_acceleration()?;
 
     let mut file = std::fs::File::create("example.msg")?;
@@ -81,12 +83,13 @@ cargo run --example mutable_dataset -- example.msg
 `MappedMsgArchive::open` maps and validates an archive without eagerly
 decoding its field data. The `MsgArchive` returned by `view()` borrows the map,
 so it cannot outlive its `MappedMsgArchive` owner. Metadata accessors remain
-cheap; `decode()` and `decode_fields()` are the explicit boundary where scalar
-blocks become an owned, mutable `MsgDataset`.
+cheap. Field-level `get()` and `fill_chunk()` reconstruct data on demand;
+`decode()` and `decode_fields()` are the explicit boundary where complete
+scalar fields become an owned, mutable `MsgDataset`.
 
 ```rust
 use glam::UVec3;
-use multires_rs::MappedMsgArchive;
+use multires_rs::{MappedMsgArchive, MsgChunkBuffer};
 
 fn main() -> anyhow::Result<()> {
     let mapped = MappedMsgArchive::open("example.msg")?;
@@ -96,6 +99,13 @@ fn main() -> anyhow::Result<()> {
     for field in archive.fields() {
         println!("{}: {:?}", field.name, field.scalar_type);
     }
+
+    let level = archive.field("density").unwrap().level(0)?;
+    println!("sample: {:?}", level.get(UVec3::new(10, 20, 30))?);
+
+    // Allocate once, then reuse this buffer for subsequent chunk fills.
+    let mut chunk = MsgChunkBuffer::new(level.scalar_type());
+    level.fill_chunk(UVec3::ZERO, &mut chunk)?;
 
     // Decode only the data needed by this operation. The result is owned and
     // may be mutated independently of the mapping.
@@ -151,9 +161,13 @@ rkyv metadata header
 u64 header offset       little-endian footer
 ```
 
-Scalar and acceleration blocks are independently addressable. `MsgArchive`
-provides validated borrowed metadata and selective field decoding;
-`MappedMsgArchive` owns a read-only memory mapping.
+Scalar directories, irregular occupancy masks, scalar payloads, acceleration
+directories, and acceleration masks are independently addressable. A full
+physical 32³ chunk stores its occupancy as a directory tag; only irregular
+masks consume a 4 KiB raw-mask record. This keeps mapped level lookup from
+opening scalar payload pages. `MsgArchive` provides validated borrowed metadata
+and selective field decoding; `MappedMsgArchive` owns a read-only memory
+mapping.
 
 ## Chunk codecs
 
@@ -184,3 +198,21 @@ closed.
 The library additionally exposes point-based slice extraction, mesh relaxation,
 and parallel meshoptimizer-backed decimation. For the latter, a C++ compiler
 may be required.
+
+## Benchmarks
+
+```console
+cargo bench --bench archive_read
+```
+
+Pass a Criterion filter to run one case, for example:
+
+```console
+cargo bench --bench archive_read -- archive_decode_scaling_dense_f32/64_chunks
+```
+
+Use `--test` for a fast smoke run that executes every benchmark once:
+
+```console
+cargo bench --bench archive_read -- --test
+```

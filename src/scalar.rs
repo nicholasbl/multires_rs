@@ -19,6 +19,7 @@ pub enum MsgScalarGrid {
 pub(crate) enum MsgScalarAccessor<'a> {
     F32(GridAccessor<'a, f32>),
     F64(GridAccessor<'a, f64>),
+    Archived(crate::archive::MsgArchiveScalarAccessor<'a>),
 }
 
 impl MsgScalarGrid {
@@ -142,10 +143,11 @@ impl MsgScalarGrid {
 }
 
 impl MsgScalarAccessor<'_> {
-    pub(crate) fn get(&mut self, point: UVec3) -> Option<f64> {
+    pub(crate) fn get(&mut self, point: UVec3) -> anyhow::Result<Option<f64>> {
         match self {
-            Self::F32(accessor) => accessor.get(point).map(f64::from),
-            Self::F64(accessor) => accessor.get(point),
+            Self::F32(accessor) => Ok(accessor.get(point).map(f64::from)),
+            Self::F64(accessor) => Ok(accessor.get(point)),
+            Self::Archived(level) => level.get(point),
         }
     }
 }

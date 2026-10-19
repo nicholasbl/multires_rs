@@ -7,7 +7,9 @@ use std::{
 
 use anyhow::{Context, Result, ensure};
 use clap::Parser;
-use multires_rs::{IsosurfaceOptions, MappedMsgArchive, Mesh3D, Sample, Surface, isosurface};
+use multires_rs::{
+    IsosurfaceOptions, MappedMsgArchive, Mesh3D, Sample, Surface, isosurface_archive,
+};
 
 #[derive(Debug, Parser)]
 #[command(about = "Extract an MC33 isosurface from a point-based MSG field")]
@@ -51,20 +53,13 @@ fn main() -> Result<()> {
             })
         })
         .collect::<Result<Vec<_>>>()?;
-    let mut selected = vec![args.field.as_str()];
-    selected.extend(
-        sampled_quantities
-            .iter()
-            .map(|sample| sample.field.as_str()),
-    );
-
     let load_start = Instant::now();
     let mapped = MappedMsgArchive::open(&args.input)?;
-    let dataset = mapped.view()?.decode_fields(&selected)?;
+    let archive = mapped.view()?;
     let load_time = load_start.elapsed();
     let extraction_start = Instant::now();
-    let (mesh, timings) = isosurface(
-        &dataset,
+    let (mesh, timings) = isosurface_archive(
+        &archive,
         IsosurfaceOptions {
             surface: Surface {
                 field: args.field,

@@ -134,3 +134,20 @@ fn prune_removes_empty_chunks() {
     grid.prune();
     assert_eq!(grid.chunk_count(), 0);
 }
+
+#[test]
+fn bitmask_keeps_uniform_occupancy_inline() {
+    use super::chunk::{BitMask, BitMaskView};
+
+    assert!(std::mem::size_of::<BitMask>() <= 2 * std::mem::size_of::<usize>());
+    assert!(matches!(
+        BitMask::empty().view(),
+        BitMaskView::Uniform(false)
+    ));
+    assert!(matches!(BitMask::full().view(), BitMaskView::Uniform(true)));
+
+    let mut irregular = BitMask::empty();
+    irregular.set(7);
+    assert!(matches!(irregular.view(), BitMaskView::Dense(_)));
+    assert!(irregular.get(7));
+}

@@ -17,8 +17,9 @@ pub mod slice;
 pub mod sparse;
 
 pub use archive::{
-    MSG_FORMAT_MAGIC, MSG_FORMAT_VERSION, MappedMsgArchive, MsgArchive, MsgArchiveFieldInfo,
-    MsgArchiveLevelInfo, MsgChunkCodec, MsgChunkCodecSelection, MsgErrorTolerance, MsgFieldCodec,
+    MSG_FORMAT_MAGIC, MSG_FORMAT_VERSION, MappedMsgArchive, MsgArchive, MsgArchiveChunkRange,
+    MsgArchiveField, MsgArchiveFieldInfo, MsgArchiveFieldLevel, MsgArchiveLevelInfo,
+    MsgChunkBuffer, MsgChunkCodec, MsgChunkCodecSelection, MsgErrorTolerance, MsgFieldCodec,
     MsgWriteOptions, read_msg, read_msg_fields, transcode_msg, view_msg, write_msg,
 };
 pub use dataset::{
@@ -33,6 +34,7 @@ pub use decimate::{
 pub use geometry::{ArchivedMat4, MsgGeometry, cell_center_to_point_geometry};
 pub use isosurface::{
     IsosurfaceOptions, IsosurfaceTimings, PerLevelTimings, Sample, Surface, isosurface,
+    isosurface_archive,
 };
 pub use mesh::{Mesh3D, RemoveDegenerateTrianglesOptions, remove_degenerate_triangles};
 pub use relax::{VertexRelaxOptions, VertexRelaxResult, VertexRelaxTimings, relax_mesh_vertices};

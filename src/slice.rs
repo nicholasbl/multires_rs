@@ -161,7 +161,7 @@ fn mesh_level(
     let mut error = None;
     level
         .active_cubes
-        .for_each_present_in_aabb(level.active_cubes.bounds_aabb(), |anchor, ()| {
+        .for_each_present_in_aabb(level.active_cubes.bounds_aabb(), |anchor| {
             if error.is_none() && component(anchor, axis_index(axis)) == anchor_axis {
                 error = emit_quad(
                     &mut mesh,
@@ -224,10 +224,10 @@ fn vertex(
     let mut uv = [0.0_f32; 2];
     for (channel, (accessor, range)) in accessors.iter_mut().zip(ranges).enumerate() {
         let a = accessor
-            .get(start)
+            .get(start)?
             .with_context(|| format!("slice sample is absent at {start:?}"))?;
         let b = accessor
-            .get(end)
+            .get(end)?
             .with_context(|| format!("slice sample is absent at {end:?}"))?;
         let value = (b - a).mul_add(t, a);
         uv[channel] = ((value - range.min) / (range.max - range.min)).clamp(0.0, 1.0) as f32;

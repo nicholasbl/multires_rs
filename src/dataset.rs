@@ -153,6 +153,21 @@ impl MsgDataset {
         Ok(dataset)
     }
 
+    /// Constructs a dataset from metadata already validated by an internal
+    /// decoder.
+    pub(crate) fn from_validated_parts(
+        time: f64,
+        geometry: MsgGeometry,
+        levels: Vec<MsgLevel>,
+    ) -> Self {
+        Self {
+            time,
+            geometry,
+            levels,
+            fields: Vec::new(),
+        }
+    }
+
     pub fn time(&self) -> f64 {
         self.time
     }
@@ -193,6 +208,12 @@ impl MsgDataset {
         Ok(())
     }
 
+    /// Adds a field whose name, level layout, bounds, precision, and values
+    /// have already been validated by an internal constructor.
+    pub(crate) fn push_validated_field(&mut self, field: MsgField) {
+        self.fields.push(field);
+    }
+
     pub fn validate(&self) -> Result<(), MsgValidationError> {
         if !self.time.is_finite() {
             return Err(MsgValidationError::new("simulation time must be finite"));
@@ -219,38 +240,59 @@ impl MsgDataset {
     /// Fine topology masks covered coarse cubes independently for every field.
     pub fn rebuild_acceleration(&mut self) -> Result<(), MsgValidationError> {
         self.validate()?;
-        for field in &mut self.fields {
-            let mut active = field
-                .levels
-                .iter()
-                .map(|level| crate::acceleration::build_active_cubes(&level.values))
-                .collect::<Vec<_>>();
-            for fine_index in (1..active.len()).rev() {
-                let coarse_index = fine_index - 1;
-                let ratio = self.levels[fine_index]
-                    .refinement_ratio_from_coarse
-                    .expect("validated finer level ratio");
-                let translation = level_translation(
-                    self.levels[coarse_index].index_origin,
-                    self.levels[fine_index].index_origin,
-                    ratio,
-                )?;
-                field.levels[fine_index].values.mask_active_cubes_from_fine(
-                    &mut active[coarse_index],
-                    ratio,
-                    translation,
-                );
-            }
-            for ((level, active_cubes), _) in field.levels.iter_mut().zip(active).zip(&self.levels)
-            {
-                level.acceleration = Some(crate::acceleration::finish_acceleration(
-                    &level.values,
-                    active_cubes,
-                ));
+        let rebuilt = self.derived_acceleration()?;
+        for (field, levels) in self.fields.iter_mut().zip(rebuilt) {
+            for (level, acceleration) in field.levels.iter_mut().zip(levels) {
+                level.acceleration = Some(acceleration);
             }
         }
         Ok(())
     }
+
+    /// Derives acceleration without mutating or trusting cached field state.
+    pub(crate) fn derived_acceleration(
+        &self,
+    ) -> Result<Vec<Vec<MsgFieldAcceleration>>, MsgValidationError> {
+        self.fields
+            .iter()
+            .map(|field| derive_field_acceleration(field, &self.levels))
+            .collect()
+    }
+}
+
+fn derive_field_acceleration(
+    field: &MsgField,
+    levels: &[MsgLevel],
+) -> Result<Vec<MsgFieldAcceleration>, MsgValidationError> {
+    let mut active = field
+        .levels
+        .iter()
+        .map(|level| crate::acceleration::build_active_cubes(&level.values))
+        .collect::<Vec<_>>();
+    for fine_index in (1..active.len()).rev() {
+        let coarse_index = fine_index - 1;
+        let ratio = levels[fine_index]
+            .refinement_ratio_from_coarse
+            .expect("validated finer level ratio");
+        let translation = level_translation(
+            levels[coarse_index].index_origin,
+            levels[fine_index].index_origin,
+            ratio,
+        )?;
+        field.levels[fine_index].values.mask_active_cubes_from_fine(
+            &mut active[coarse_index],
+            ratio,
+            translation,
+        );
+    }
+    Ok(field
+        .levels
+        .iter()
+        .zip(active)
+        .map(|(level, active_cubes)| {
+            crate::acceleration::finish_acceleration(&level.values, active_cubes)
+        })
+        .collect())
 }
 
 fn level_translation(

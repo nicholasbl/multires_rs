@@ -16,10 +16,10 @@ pub(super) fn sampled_values_on_edge(
 ) -> Result<U16Vec2> {
     encode_sampled_values(sampled_quantities, ranges, |grid| {
         let start_value = grid
-            .get(start)
+            .get(start)?
             .with_context(|| format!("sample value is absent at edge start {start:?}"))?;
         let end_value = grid
-            .get(end)
+            .get(end)?
             .with_context(|| format!("sample value is absent at edge end {end:?}"))?;
         Ok((end_value - start_value).mul_add(t, start_value))
     })
@@ -37,7 +37,7 @@ pub(super) fn sampled_values_weighted(
     encode_sampled_values(sampled_quantities, ranges, |grid| {
         let mut value = 0.0;
         for (&position, &weight) in positions.iter().zip(weights) {
-            let sample = grid.get(position).with_context(|| {
+            let sample = grid.get(position)?.with_context(|| {
                 format!("sample value is absent at MC33 interior vertex corner {position:?}")
             })?;
             value += sample * weight;

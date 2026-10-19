@@ -48,7 +48,7 @@ where
         let chunk_min = key * CHUNK_SIZE;
         let mut active_mask = [0_u64; MASK_WORDS];
         let mut accessor = samples.accessor();
-        for (word_index, &word) in mask.iter().enumerate() {
+        for (word_index, &word) in mask.as_words().iter().enumerate() {
             let mut remaining = word;
             while remaining != 0 {
                 let bit = remaining.trailing_zeros() as usize;

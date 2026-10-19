@@ -4,7 +4,7 @@ use glam::{I64Vec3, UVec3};
 
 use super::{
     Aabb3u,
-    chunk::{BitMask, Chunk},
+    chunk::{BitMask, BitMaskView, Chunk},
     layout::{
         ChunkKey, add_uvec3, chunk_key_range_for_aabb, chunk_local_intersection, local_from_index,
         local_index_vec, local_pos, scaled_voxel_aabb_in_fine_grid, sub_uvec3,
@@ -27,12 +27,12 @@ where
     Uniform {
         key: UVec3,
         value: T,
-        mask: [u64; super::MASK_WORDS],
+        mask: BitMaskView<'a>,
     },
     Dense {
         key: UVec3,
         values: &'a [T],
-        mask: [u64; super::MASK_WORDS],
+        mask: BitMaskView<'a>,
     },
 }
 
@@ -103,18 +103,20 @@ where
     where
         F: FnMut(SparseGridChunkView<'_, T>),
     {
-        for (&key, chunk) in &self.chunks {
+        let mut chunks = self.chunks.iter().collect::<Vec<_>>();
+        chunks.sort_by_key(|(key, _)| (key.x, key.y, key.z));
+        for (&key, chunk) in chunks {
             let key = UVec3::new(key.x, key.y, key.z);
             match chunk {
                 Chunk::Uniform { value, mask } => f(SparseGridChunkView::Uniform {
                     key,
                     value: *value,
-                    mask: mask.words(),
+                    mask: mask.view(),
                 }),
                 Chunk::Dense { values, mask } => f(SparseGridChunkView::Dense {
                     key,
                     values,
-                    mask: mask.words(),
+                    mask: mask.view(),
                 }),
             }
         }
@@ -136,12 +138,12 @@ where
                     Chunk::Uniform { value, mask } => f(SparseGridChunkView::Uniform {
                         key,
                         value: *value,
-                        mask: mask.words(),
+                        mask: mask.view(),
                     }),
                     Chunk::Dense { values, mask } => f(SparseGridChunkView::Dense {
                         key,
                         values,
-                        mask: mask.words(),
+                        mask: mask.view(),
                     }),
                 }
             })

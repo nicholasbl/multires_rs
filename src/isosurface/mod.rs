@@ -13,9 +13,9 @@ use anyhow::{Context, Result, ensure};
 use glam::UVec3;
 use rayon::prelude::*;
 
-use crate::point_grid::{PointGridLevel, point_grid_levels};
+use crate::point_grid::{PointGridLevel, archive_point_grid_levels, point_grid_levels};
 use crate::{
-    Mesh3D, MsgDataset,
+    Mesh3D, MsgArchive, MsgDataset,
     sparse::{Aabb3u, CHUNK_SIZE},
 };
 
@@ -64,28 +64,63 @@ pub fn isosurface(
     options: IsosurfaceOptions,
 ) -> Result<(Mesh3D, IsosurfaceTimings)> {
     validate_options(dataset, &options)?;
-    let sampled_names = options
-        .sampled_quantities
-        .iter()
-        .map(|sample| sample.field.as_str())
-        .collect::<Vec<_>>();
-    let ranges = options
-        .sampled_quantities
-        .iter()
-        .map(|sample| SampleRange {
-            min: *sample.range.start(),
-            max: *sample.range.end(),
-        })
-        .collect::<Vec<_>>();
     let start = Instant::now();
+    let sampled_names = sampled_names(&options);
+    let ranges = sample_ranges(&options);
     let levels = point_grid_levels(
         dataset,
         &options.surface.field,
         &sampled_names,
         options.levels.as_ref(),
     )?;
-    let preparation = start.elapsed();
+    mesh_levels(levels, &options, &ranges, start.elapsed())
+}
 
+/// Extract an isosurface directly from an archive without materializing a
+/// [`MsgDataset`]. Scalar values are reconstructed on demand.
+pub fn isosurface_archive(
+    archive: &MsgArchive<'_>,
+    options: IsosurfaceOptions,
+) -> Result<(Mesh3D, IsosurfaceTimings)> {
+    validate_archive_options(archive, &options)?;
+    let start = Instant::now();
+    let sampled_names = sampled_names(&options);
+    let ranges = sample_ranges(&options);
+    let levels = archive_point_grid_levels(
+        archive,
+        &options.surface.field,
+        &sampled_names,
+        options.levels.as_ref(),
+        options.surface.value,
+    )?;
+    mesh_levels(levels, &options, &ranges, start.elapsed())
+}
+
+fn sampled_names(options: &IsosurfaceOptions) -> Vec<&str> {
+    options
+        .sampled_quantities
+        .iter()
+        .map(|sample| sample.field.as_str())
+        .collect()
+}
+
+fn sample_ranges(options: &IsosurfaceOptions) -> Vec<SampleRange> {
+    options
+        .sampled_quantities
+        .iter()
+        .map(|sample| SampleRange {
+            min: *sample.range.start(),
+            max: *sample.range.end(),
+        })
+        .collect()
+}
+
+fn mesh_levels(
+    levels: Vec<PointGridLevel<'_>>,
+    options: &IsosurfaceOptions,
+    ranges: &[SampleRange],
+    preparation: Duration,
+) -> Result<(Mesh3D, IsosurfaceTimings)> {
     let mut mesh = Mesh3D::default();
     let mut timings = Vec::with_capacity(levels.len());
     for level in &levels {
@@ -116,6 +151,43 @@ pub fn isosurface(
             per_level: timings,
         },
     ))
+}
+
+fn validate_archive_options(archive: &MsgArchive<'_>, options: &IsosurfaceOptions) -> Result<()> {
+    ensure!(
+        !options.surface.field.is_empty(),
+        "surface field cannot be empty"
+    );
+    ensure!(
+        archive.field(&options.surface.field).is_some(),
+        "surface field {:?} is absent",
+        options.surface.field
+    );
+    ensure!(options.surface.value.is_finite(), "isovalue must be finite");
+    ensure!(
+        options.sampled_quantities.len() <= 2,
+        "at most two sampled fields are supported"
+    );
+    for sample in &options.sampled_quantities {
+        ensure!(
+            archive.field(&sample.field).is_some(),
+            "sampled field {:?} is absent",
+            sample.field
+        );
+        let (min, max) = (*sample.range.start(), *sample.range.end());
+        ensure!(
+            min.is_finite() && max.is_finite() && max > min,
+            "invalid sampled field range"
+        );
+    }
+    if let Some(levels) = &options.levels {
+        ensure!(levels.start() <= levels.end(), "level range is reversed");
+        ensure!(
+            *levels.end() < archive.level_count(),
+            "level range exceeds archive"
+        );
+    }
+    Ok(())
 }
 
 fn validate_options(dataset: &MsgDataset, options: &IsosurfaceOptions) -> Result<()> {
@@ -161,6 +233,13 @@ fn mesh_level_parallel(
     isovalue: f64,
 ) -> Result<Mesh3D> {
     let cube_bounds = level.active_cubes.bounds();
+    if !level
+        .value_ranges
+        .iter()
+        .any(|range| range.min <= isovalue && isovalue <= range.max)
+    {
+        return Ok(Mesh3D::default());
+    }
     let mut chunks = level
         .value_ranges
         .par_iter()
@@ -261,7 +340,10 @@ mod tests {
     use glam::{DMat4, DVec3, IVec3};
 
     use super::*;
-    use crate::{MsgField, MsgFieldLevel, MsgGeometry, MsgLevel, MsgScalarGrid, MsgScalarType};
+    use crate::{
+        MsgField, MsgFieldLevel, MsgGeometry, MsgLevel, MsgScalarGrid, MsgScalarType,
+        MsgWriteOptions, view_msg, write_msg,
+    };
 
     #[test]
     fn extracts_point_field_through_global_transform() -> Result<()> {
@@ -291,16 +373,14 @@ mod tests {
         ))?;
         dataset.rebuild_acceleration()?;
 
-        let (mesh, _) = isosurface(
-            &dataset,
-            IsosurfaceOptions {
-                surface: Surface {
-                    field: "density".into(),
-                    value: 0.5,
-                },
-                ..IsosurfaceOptions::default()
+        let options = IsosurfaceOptions {
+            surface: Surface {
+                field: "density".into(),
+                value: 0.5,
             },
-        )?;
+            ..IsosurfaceOptions::default()
+        };
+        let (mesh, _) = isosurface(&dataset, options.clone())?;
         ensure!(!mesh.indices.is_empty(), "expected one planar surface");
         ensure!(
             mesh.positions
@@ -308,6 +388,13 @@ mod tests {
                 .all(|position| (position[0] - 10.5).abs() <= f32::EPSILON),
             "global transform was not applied to surface positions"
         );
+        let mut bytes = Vec::new();
+        write_msg(&dataset, &MsgWriteOptions::default(), &mut bytes)?;
+        let archive = view_msg(&bytes)?;
+        let (archive_mesh, _) = isosurface_archive(&archive, options)?;
+        assert_eq!(archive_mesh.positions, mesh.positions);
+        assert_eq!(archive_mesh.uv, mesh.uv);
+        assert_eq!(archive_mesh.indices, mesh.indices);
         Ok(())
     }
 }

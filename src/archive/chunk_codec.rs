@@ -1,6 +1,11 @@
 use anyhow::{Context, Result, bail, ensure};
+use rayon::prelude::*;
 
-use super::archive::{ArchiveScalarChunk, ArchiveScalarGrid, array_to_uvec3, uvec3_to_array};
+use super::format::{
+    ArchivedScalarChunkRecord, ArchivedScalarGridRecord, MASK_DENSE, MASK_FULL, ScalarChunkRecord,
+    ScalarGridRecord, archived_mask_contains, archived_mask_words, array_to_uvec3, uvec3_to_array,
+    validate_chunk_key, validate_chunk_mask,
+};
 use super::{MsgChunkCodec, MsgChunkCodecSelection, ResolvedFieldCodec};
 use crate::sparse::{CHUNK_BITS, CHUNK_VOLUME, MASK_WORDS, SparseGrid3, SparseGridChunkView};
 
@@ -25,14 +30,13 @@ pub(super) const CODEC_AFFINE_RESIDUAL_U16: u32 = 10;
 pub(super) const CODEC_AFFINE_RESIDUAL_U32: u32 = 11;
 const CODEC_VERSION: u16 = 1;
 
-trait Scalar: Copy + PartialEq + Default + Sync {
+trait Scalar: Copy + PartialEq + Default + Send + Sync {
     const TYPE: u8;
     const WIDTH: usize;
 
     fn to_domain(self) -> f64;
     fn from_domain(value: f64) -> Self;
     fn append_raw(self, bytes: &mut Vec<u8>);
-    fn read_raw(bytes: &[u8]) -> Self;
 }
 
 impl Scalar for f32 {
@@ -49,10 +53,6 @@ impl Scalar for f32 {
 
     fn append_raw(self, bytes: &mut Vec<u8>) {
         bytes.extend_from_slice(&self.to_le_bytes());
-    }
-
-    fn read_raw(bytes: &[u8]) -> Self {
-        Self::from_le_bytes(bytes.try_into().expect("validated f32 width"))
     }
 }
 
@@ -71,14 +71,33 @@ impl Scalar for f64 {
     fn append_raw(self, bytes: &mut Vec<u8>) {
         bytes.extend_from_slice(&self.to_le_bytes());
     }
-
-    fn read_raw(bytes: &[u8]) -> Self {
-        Self::from_le_bytes(bytes.try_into().expect("validated f64 width"))
-    }
 }
 
 struct EncodedCandidate {
     codec: MsgChunkCodec,
+    max_abs_error: f64,
+    metadata: Vec<u8>,
+    payload: Vec<u8>,
+}
+
+pub(super) struct EncodedScalarGrid {
+    pub(super) directory: ScalarGridRecord,
+    pub(super) masks: Vec<u8>,
+    pub(super) payloads: Vec<u8>,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct ArchivedScalarGridView<'a> {
+    pub(super) directory: &'a ArchivedScalarGridRecord,
+    pub(super) masks: &'a [u8],
+    pub(super) payloads: &'a [u8],
+}
+
+struct PendingScalarChunk {
+    key: [u32; 3],
+    mask: [u64; MASK_WORDS],
+    mask_full: bool,
+    codec_id: u32,
     max_abs_error: f64,
     metadata: Vec<u8>,
     payload: Vec<u8>,
@@ -142,21 +161,21 @@ impl<T: Scalar> Candidate<T> {
 pub(super) fn encode_f32(
     grid: &SparseGrid3<f32>,
     policy: ResolvedFieldCodec,
-) -> Result<ArchiveScalarGrid> {
+) -> Result<EncodedScalarGrid> {
     encode_grid(grid, policy)
 }
 
 pub(super) fn encode_f64(
     grid: &SparseGrid3<f64>,
     policy: ResolvedFieldCodec,
-) -> Result<ArchiveScalarGrid> {
+) -> Result<EncodedScalarGrid> {
     encode_grid(grid, policy)
 }
 
 fn encode_grid<T: Scalar>(
     grid: &SparseGrid3<T>,
     policy: ResolvedFieldCodec,
-) -> Result<ArchiveScalarGrid> {
+) -> Result<EncodedScalarGrid> {
     if let Some(error) = policy.error_tolerance {
         ensure!(
             error.absolute.is_finite() && error.absolute >= 0.0,
@@ -175,50 +194,82 @@ fn encode_grid<T: Scalar>(
     );
 
     let encoded = grid.par_map_chunks(|chunk| match chunk {
-        SparseGridChunkView::Uniform { key, value, mask } => Ok(ArchiveScalarChunk {
+        SparseGridChunkView::Uniform { key, value, mask } => Ok(PendingScalarChunk {
             key: uvec3_to_array(key),
-            mask: Box::new(mask),
+            mask: *mask.as_words(),
+            mask_full: mask.is_full(),
             codec_id: CODEC_UNIFORM,
-            codec_version: CODEC_VERSION,
-            codec_flags: 0,
             max_abs_error: 0.0,
             metadata: encode_uniform(value),
-            payload_length: 0,
             payload: Vec::new(),
         }),
-        SparseGridChunkView::Dense { key, values, mask } => encode_dense(key, values, mask, policy),
+        SparseGridChunkView::Dense { key, values, mask } => {
+            encode_dense(key, values, mask.as_words(), policy)
+        }
     });
     let mut chunks = encoded.into_iter().collect::<Result<Vec<_>>>()?;
     chunks.sort_by_key(|chunk| chunk.key);
-    Ok(ArchiveScalarGrid {
-        bounds: uvec3_to_array(grid.bounds()),
-        decoded_type: T::TYPE,
-        chunks,
+    let mut masks = Vec::new();
+    let mut payloads = Vec::new();
+    let chunks = chunks
+        .into_iter()
+        .map(|chunk| {
+            let (mask_kind, mask_offset) = if chunk.mask_full {
+                (MASK_FULL, 0)
+            } else {
+                let offset = masks.len() as u64;
+                for word in chunk.mask {
+                    masks.extend_from_slice(&word.to_le_bytes());
+                }
+                (MASK_DENSE, offset)
+            };
+            let payload_offset = payloads.len() as u64;
+            let payload_length = chunk.payload.len() as u64;
+            payloads.extend_from_slice(&chunk.payload);
+            ScalarChunkRecord {
+                key: chunk.key,
+                mask_kind,
+                mask_offset,
+                codec_id: chunk.codec_id,
+                codec_version: CODEC_VERSION,
+                codec_flags: 0,
+                max_abs_error: chunk.max_abs_error,
+                metadata: chunk.metadata,
+                payload_offset,
+                payload_length,
+            }
+        })
+        .collect();
+    Ok(EncodedScalarGrid {
+        directory: ScalarGridRecord {
+            bounds: uvec3_to_array(grid.bounds()),
+            decoded_type: T::TYPE,
+            chunks,
+        },
+        masks,
+        payloads,
     })
 }
 
 fn encode_dense<T: Scalar>(
     key: glam::UVec3,
     values: &[T],
-    mask: [u64; MASK_WORDS],
+    mask: &[u64; MASK_WORDS],
     policy: ResolvedFieldCodec,
-) -> Result<ArchiveScalarChunk> {
+) -> Result<PendingScalarChunk> {
     ensure!(values.len() == CHUNK_VOLUME, "invalid dense chunk length");
-    let selected = select_candidate(values, &mask, policy)
+    let selected = select_candidate(values, mask, policy)
         .with_context(|| format!("encoding chunk ({}, {}, {})", key.x, key.y, key.z))?;
-    let best = materialize_candidate(selected, values, &mask);
+    let best = materialize_candidate(selected, values, mask);
 
-    let (payload_length, payload) = pack_payload(&best.payload)?;
-    Ok(ArchiveScalarChunk {
+    Ok(PendingScalarChunk {
         key: uvec3_to_array(key),
-        mask: Box::new(mask),
+        mask: *mask,
+        mask_full: mask.iter().all(|&word| word == u64::MAX),
         codec_id: codec_id(best.codec),
-        codec_version: CODEC_VERSION,
-        codec_flags: 0,
         max_abs_error: best.max_abs_error,
         metadata: best.metadata,
-        payload_length,
-        payload,
+        payload: best.payload,
     })
 }
 
@@ -654,119 +705,414 @@ fn fit_affine<T: Scalar>(values: &[T], mask: &[u64; MASK_WORDS]) -> Option<[f64;
         .then_some(coefficients)
 }
 
-pub(super) fn decode_f32(archive: ArchiveScalarGrid) -> Result<SparseGrid3<f32>> {
-    decode_grid(archive)
+pub(super) fn decode_f32(
+    archive: ArchivedScalarGridView<'_>,
+    expected_bounds: glam::UVec3,
+) -> Result<SparseGrid3<f32>> {
+    decode_grid(archive, expected_bounds)
 }
 
-pub(super) fn decode_f64(archive: ArchiveScalarGrid) -> Result<SparseGrid3<f64>> {
-    decode_grid(archive)
+pub(super) fn decode_f64(
+    archive: ArchivedScalarGridView<'_>,
+    expected_bounds: glam::UVec3,
+) -> Result<SparseGrid3<f64>> {
+    decode_grid(archive, expected_bounds)
 }
 
-fn decode_grid<T: Scalar>(archive: ArchiveScalarGrid) -> Result<SparseGrid3<T>> {
+pub(super) fn validate_archived_grid(
+    archive: ArchivedScalarGridView<'_>,
+    expected_bounds: glam::UVec3,
+    expected_type: u8,
+) -> Result<()> {
     ensure!(
-        archive.decoded_type == T::TYPE,
+        archive.directory.decoded_type == expected_type,
         "MSG scalar chunk type mismatch"
     );
-    let mut grid =
-        SparseGrid3::with_chunk_capacity(array_to_uvec3(archive.bounds), archive.chunks.len());
-    for chunk in archive.chunks {
+    let bounds = archive.directory.bounds.map(|value| value.to_native());
+    ensure!(
+        bounds == expected_bounds.to_array(),
+        "scalar grid bounds do not match the field level"
+    );
+    let mut previous_key = None;
+    let mut expected_mask_offset = 0_u64;
+    let mut expected_payload_offset = 0_u64;
+    for chunk in archive.directory.chunks.iter() {
+        let codec_id = chunk.codec_id.to_native();
         ensure!(
-            chunk.codec_version == CODEC_VERSION,
+            chunk.codec_version.to_native() == CODEC_VERSION,
             "unsupported chunk codec {} version {}",
-            chunk.codec_id,
-            chunk.codec_version
+            codec_id,
+            chunk.codec_version.to_native()
         );
-        ensure!(chunk.codec_flags == 0, "unsupported chunk codec flags");
         ensure!(
-            chunk.max_abs_error.is_finite() && chunk.max_abs_error >= 0.0,
+            chunk.codec_flags.to_native() == 0,
+            "unsupported chunk codec flags"
+        );
+        let max_abs_error = chunk.max_abs_error.to_native();
+        ensure!(
+            max_abs_error.is_finite() && max_abs_error >= 0.0,
             "invalid chunk error bound"
         );
-        let key = array_to_uvec3(chunk.key);
-        let mask = *chunk.mask;
-        let payload = unpack_payload(&chunk.payload, chunk.payload_length)?;
-        match chunk.codec_id {
+        let key = chunk.key.map(|value| value.to_native());
+        ensure!(
+            previous_key.is_none_or(|previous| previous < key),
+            "scalar chunk keys are not unique and sorted"
+        );
+        let full_chunk = validate_chunk_key(key, bounds)?;
+        let mask = archived_mask_words(
+            chunk.mask_kind,
+            chunk.mask_offset.to_native(),
+            archive.masks,
+        )?;
+        ensure!(
+            mask.iter().any(|&word| word != 0),
+            "empty chunk mask is not canonical"
+        );
+        if chunk.mask_kind == MASK_FULL {
+            ensure!(full_chunk, "full mask is invalid for a partial edge chunk");
+            ensure!(
+                chunk.mask_offset.to_native() == 0,
+                "full mask has a nonzero offset"
+            );
+        } else {
+            ensure!(
+                chunk.mask_offset.to_native() == expected_mask_offset,
+                "scalar mask block is not canonical"
+            );
+            expected_mask_offset += (MASK_WORDS * 8) as u64;
+            ensure!(
+                mask.iter().any(|&word| word != u64::MAX),
+                "dense full chunk mask is not canonical"
+            );
+        }
+        if !full_chunk {
+            validate_chunk_mask(key, bounds, &mask)?;
+        }
+        ensure!(
+            chunk.payload_offset.to_native() == expected_payload_offset,
+            "scalar payload block is not canonical"
+        );
+        let payload_length = validate_payload(chunk, archive.payloads)?.len();
+        expected_payload_offset += payload_length as u64;
+        match codec_id {
             CODEC_UNIFORM => {
-                ensure!(payload.is_empty(), "uniform chunk has a payload");
-                let value = read_f64_array::<1>(&chunk.metadata)?[0];
-                grid.insert_uniform_chunk(key, T::from_domain(value), mask);
+                ensure!(payload_length == 0, "uniform chunk has a payload");
+                read_f64_array::<1>(&chunk.metadata)?;
             }
-            id @ CODEC_DENSE_F64 => {
-                ensure!(
-                    id == CODEC_DENSE_F64 && T::TYPE == TYPE_F64,
-                    "dense chunk codec is incompatible with decoded scalar type"
-                );
+            CODEC_DENSE_F64 => {
+                ensure!(expected_type == TYPE_F64, "dense f64 chunk type mismatch");
                 ensure!(chunk.metadata.is_empty(), "dense chunk has metadata");
                 ensure!(
-                    payload.len() == CHUNK_VOLUME * T::WIDTH,
+                    payload_length == CHUNK_VOLUME * 8,
                     "invalid native dense chunk length"
                 );
-                let values = payload
-                    .chunks_exact(T::WIDTH)
-                    .map(T::read_raw)
-                    .collect::<Vec<_>>();
-                grid.insert_dense_chunk(key, values.into_boxed_slice(), mask);
             }
             CODEC_DENSE_F32 => {
                 ensure!(chunk.metadata.is_empty(), "dense f32 chunk has metadata");
                 ensure!(
-                    payload.len() == CHUNK_VOLUME * 4,
+                    payload_length == CHUNK_VOLUME * 4,
                     "invalid dense f32 chunk length"
                 );
-                let values = payload
-                    .chunks_exact(4)
-                    .map(|bytes| {
-                        T::from_domain(f64::from(f32::from_le_bytes(bytes.try_into().unwrap())))
-                    })
-                    .collect::<Vec<_>>();
-                grid.insert_dense_chunk(key, values.into_boxed_slice(), mask);
             }
             id @ (CODEC_QUANTIZED_U8 | CODEC_QUANTIZED_U16 | CODEC_QUANTIZED_U32) => {
-                let bits = codec_bits(id);
-                let offset = decode_quantized_metadata(&chunk.metadata, false)?;
-                let values = decode_codes::<T>(&payload, bits, |_, code| {
-                    offset[0] + code as f64 * offset[1]
-                })?;
-                grid.insert_dense_chunk(key, values.into_boxed_slice(), mask);
+                let width = usize::from(codec_bits(id) / 8);
+                ensure!(
+                    payload_length == CHUNK_VOLUME * width,
+                    "invalid quantized chunk length"
+                );
+                decode_quantized_metadata(&chunk.metadata, false)?;
             }
             CODEC_AFFINE_F64 => {
-                ensure!(payload.is_empty(), "affine chunk has a payload");
-                let coefficients = read_f64_array::<4>(&chunk.metadata)?;
-                let values = (0..CHUNK_VOLUME)
-                    .map(|index| T::from_domain(predict(coefficients, index)))
-                    .collect::<Vec<_>>();
-                grid.insert_dense_chunk(key, values.into_boxed_slice(), mask);
+                ensure!(payload_length == 0, "affine chunk has a payload");
+                read_f64_array::<4>(&chunk.metadata)?;
             }
             id @ (CODEC_AFFINE_RESIDUAL_U8
             | CODEC_AFFINE_RESIDUAL_U16
             | CODEC_AFFINE_RESIDUAL_U32) => {
-                let bits = codec_bits(id);
-                let values = decode_quantized_metadata(&chunk.metadata, true)?;
-                let coefficients = [values[0], values[1], values[2], values[3]];
-                let residual_min = values[4];
-                let residual_step = values[5];
-                let decoded = decode_codes::<T>(&payload, bits, |index, code| {
-                    predict(coefficients, index) + residual_min + code as f64 * residual_step
-                })?;
-                grid.insert_dense_chunk(key, decoded.into_boxed_slice(), mask);
+                let width = usize::from(codec_bits(id) / 8);
+                ensure!(
+                    payload_length == CHUNK_VOLUME * width,
+                    "invalid quantized chunk length"
+                );
+                decode_quantized_metadata(&chunk.metadata, true)?;
             }
             id => bail!("unsupported MSG chunk codec {id}"),
+        }
+        previous_key = Some(key);
+    }
+    ensure!(
+        expected_mask_offset as usize == archive.masks.len(),
+        "scalar mask block has trailing data"
+    );
+    ensure!(
+        expected_payload_offset as usize == archive.payloads.len(),
+        "scalar payload block has trailing data"
+    );
+    Ok(())
+}
+
+pub(super) fn find_archived_chunk(
+    archive: &ArchivedScalarGridRecord,
+    key: [u32; 3],
+) -> Option<&ArchivedScalarChunkRecord> {
+    archive
+        .chunks
+        .binary_search_by(|chunk| chunk.key.map(|component| component.to_native()).cmp(&key))
+        .ok()
+        .map(|index| &archive.chunks[index])
+}
+
+pub(super) fn archived_chunk_present_in(
+    archive: ArchivedScalarGridView<'_>,
+    chunk: &ArchivedScalarChunkRecord,
+    index: usize,
+) -> Result<bool> {
+    archived_mask_contains(
+        chunk.mask_kind,
+        chunk.mask_offset.to_native(),
+        archive.masks,
+        index,
+    )
+}
+
+pub(super) fn decode_archived_value(
+    archive: ArchivedScalarGridView<'_>,
+    chunk: &ArchivedScalarChunkRecord,
+    index: usize,
+) -> Result<f64> {
+    ensure!(index < CHUNK_VOLUME, "chunk-local index is out of bounds");
+    let codec_id = chunk.codec_id.to_native();
+    let payload = validate_payload(chunk, archive.payloads)?;
+    let physical = match codec_id {
+        CODEC_UNIFORM => read_f64_array::<1>(&chunk.metadata)?[0],
+        CODEC_DENSE_F64 => f64::from_bits(payload_code::<8>(payload, index)),
+        CODEC_DENSE_F32 => f64::from(f32::from_bits(payload_code::<4>(payload, index) as u32)),
+        id @ (CODEC_QUANTIZED_U8 | CODEC_QUANTIZED_U16 | CODEC_QUANTIZED_U32) => {
+            let values = decode_quantized_metadata(&chunk.metadata, false)?;
+            match codec_bits(id) {
+                8 => values[0] + payload_code::<1>(payload, index) as f64 * values[1],
+                16 => values[0] + payload_code::<2>(payload, index) as f64 * values[1],
+                32 => values[0] + payload_code::<4>(payload, index) as f64 * values[1],
+                _ => unreachable!(),
+            }
+        }
+        CODEC_AFFINE_F64 => predict(read_f64_array::<4>(&chunk.metadata)?, index),
+        id @ (CODEC_AFFINE_RESIDUAL_U8 | CODEC_AFFINE_RESIDUAL_U16 | CODEC_AFFINE_RESIDUAL_U32) => {
+            let values = decode_quantized_metadata(&chunk.metadata, true)?;
+            let predicted = predict([values[0], values[1], values[2], values[3]], index);
+            let code = match codec_bits(id) {
+                8 => payload_code::<1>(payload, index),
+                16 => payload_code::<2>(payload, index),
+                32 => payload_code::<4>(payload, index),
+                _ => unreachable!(),
+            };
+            predicted + values[4] + code as f64 * values[5]
+        }
+        id => bail!("unsupported MSG chunk codec {id}"),
+    };
+    let decoded = if archive.directory.decoded_type == TYPE_F32 {
+        f64::from(physical as f32)
+    } else {
+        physical
+    };
+    ensure!(
+        decoded.is_finite(),
+        "decoded chunk contains a non-finite value"
+    );
+    Ok(decoded)
+}
+
+pub(super) fn decode_archived_chunk_f32(
+    archive: ArchivedScalarGridView<'_>,
+    chunk: &ArchivedScalarChunkRecord,
+    values: &mut [f32],
+) -> Result<()> {
+    decode_archived_chunk_into(archive, chunk, values)
+}
+
+pub(super) fn decode_archived_chunk_f64(
+    archive: ArchivedScalarGridView<'_>,
+    chunk: &ArchivedScalarChunkRecord,
+    values: &mut [f64],
+) -> Result<()> {
+    decode_archived_chunk_into(archive, chunk, values)
+}
+
+fn decode_archived_chunk_into<T: Scalar>(
+    archive: ArchivedScalarGridView<'_>,
+    chunk: &ArchivedScalarChunkRecord,
+    values: &mut [T],
+) -> Result<()> {
+    ensure!(values.len() == CHUNK_VOLUME, "invalid chunk buffer length");
+    ensure!(
+        archive.directory.decoded_type == T::TYPE,
+        "chunk buffer scalar type mismatch"
+    );
+    let mask = archived_mask_words(
+        chunk.mask_kind,
+        chunk.mask_offset.to_native(),
+        archive.masks,
+    )?;
+    let payload = validate_payload(chunk, archive.payloads)?;
+    let mut store = |index: usize, physical: f64| -> Result<()> {
+        let decoded = T::from_domain(physical);
+        ensure!(
+            !present(&mask, index) || decoded.to_domain().is_finite(),
+            "decoded chunk contains a non-finite present value"
+        );
+        values[index] = decoded;
+        Ok(())
+    };
+    match chunk.codec_id.to_native() {
+        CODEC_UNIFORM => {
+            let physical = read_f64_array::<1>(&chunk.metadata)?[0];
+            for index in 0..CHUNK_VOLUME {
+                store(index, physical)?;
+            }
+        }
+        CODEC_DENSE_F64 => {
+            for index in 0..CHUNK_VOLUME {
+                store(index, f64::from_bits(payload_code::<8>(payload, index)))?;
+            }
+        }
+        CODEC_DENSE_F32 => {
+            for index in 0..CHUNK_VOLUME {
+                store(
+                    index,
+                    f64::from(f32::from_bits(payload_code::<4>(payload, index) as u32)),
+                )?;
+            }
+        }
+        id @ (CODEC_QUANTIZED_U8 | CODEC_QUANTIZED_U16 | CODEC_QUANTIZED_U32) => {
+            let metadata = decode_quantized_metadata(&chunk.metadata, false)?;
+            for index in 0..CHUNK_VOLUME {
+                let code = match codec_bits(id) {
+                    8 => payload_code::<1>(payload, index),
+                    16 => payload_code::<2>(payload, index),
+                    32 => payload_code::<4>(payload, index),
+                    _ => unreachable!(),
+                };
+                store(index, metadata[0] + code as f64 * metadata[1])?;
+            }
+        }
+        CODEC_AFFINE_F64 => {
+            let coefficients = read_f64_array::<4>(&chunk.metadata)?;
+            for index in 0..CHUNK_VOLUME {
+                store(index, predict(coefficients, index))?;
+            }
+        }
+        id @ (CODEC_AFFINE_RESIDUAL_U8 | CODEC_AFFINE_RESIDUAL_U16 | CODEC_AFFINE_RESIDUAL_U32) => {
+            let metadata = decode_quantized_metadata(&chunk.metadata, true)?;
+            let coefficients = [metadata[0], metadata[1], metadata[2], metadata[3]];
+            for index in 0..CHUNK_VOLUME {
+                let code = match codec_bits(id) {
+                    8 => payload_code::<1>(payload, index),
+                    16 => payload_code::<2>(payload, index),
+                    32 => payload_code::<4>(payload, index),
+                    _ => unreachable!(),
+                };
+                store(
+                    index,
+                    predict(coefficients, index) + metadata[4] + code as f64 * metadata[5],
+                )?;
+            }
+        }
+        id => bail!("unsupported MSG chunk codec {id}"),
+    }
+    Ok(())
+}
+
+fn decode_grid<T: Scalar>(
+    archive: ArchivedScalarGridView<'_>,
+    expected_bounds: glam::UVec3,
+) -> Result<SparseGrid3<T>> {
+    validate_archived_grid(archive, expected_bounds, T::TYPE)?;
+    let bounds = archive.directory.bounds.map(|value| value.to_native());
+    let decode = |chunk: &ArchivedScalarChunkRecord| -> Result<DecodedChunk<T>> {
+        let key = array_to_uvec3(chunk.key.map(|value| value.to_native()));
+        let mask = archived_mask_words(
+            chunk.mask_kind,
+            chunk.mask_offset.to_native(),
+            archive.masks,
+        )?;
+        if chunk.codec_id.to_native() == CODEC_UNIFORM {
+            let value = T::from_domain(read_f64_array::<1>(&chunk.metadata)?[0]);
+            ensure!(
+                mask.iter().all(|&word| word == 0) || value.to_domain().is_finite(),
+                "decoded chunk contains a non-finite present value"
+            );
+            Ok(DecodedChunk::Uniform { key, value, mask })
+        } else {
+            let mut values = vec![T::default(); CHUNK_VOLUME];
+            decode_archived_chunk_into(archive, chunk, &mut values)?;
+            Ok(DecodedChunk::Dense {
+                key,
+                values: values.into_boxed_slice(),
+                mask,
+            })
+        }
+    };
+    let decoded = if archive.directory.chunks.len() >= 8 {
+        archive
+            .directory
+            .chunks
+            .par_iter()
+            .map(decode)
+            .collect::<Result<Vec<_>>>()?
+    } else {
+        archive
+            .directory
+            .chunks
+            .iter()
+            .map(decode)
+            .collect::<Result<Vec<_>>>()?
+    };
+    let mut grid =
+        SparseGrid3::with_chunk_capacity(array_to_uvec3(bounds), archive.directory.chunks.len());
+    for chunk in decoded {
+        match chunk {
+            DecodedChunk::Uniform { key, value, mask } => {
+                grid.insert_uniform_chunk(key, value, mask);
+            }
+            DecodedChunk::Dense { key, values, mask } => {
+                grid.insert_dense_chunk(key, values, mask);
+            }
         }
     }
     Ok(grid)
 }
 
-fn decode_quantized_metadata(metadata: &[u8], affine: bool) -> Result<Vec<f64>> {
+enum DecodedChunk<T>
+where
+    T: Copy + PartialEq,
+{
+    Uniform {
+        key: glam::UVec3,
+        value: T,
+        mask: [u64; MASK_WORDS],
+    },
+    Dense {
+        key: glam::UVec3,
+        values: Box<[T]>,
+        mask: [u64; MASK_WORDS],
+    },
+}
+
+fn decode_quantized_metadata(metadata: &[u8], affine: bool) -> Result<[f64; 6]> {
     let count = if affine { 6 } else { 2 };
     ensure!(
         metadata.len() == count * 8,
         "invalid quantized chunk metadata"
     );
-    let values = metadata
-        .chunks_exact(8)
-        .map(|bytes| f64::from_le_bytes(bytes.try_into().unwrap()))
-        .collect::<Vec<_>>();
+    let values = std::array::from_fn(|index| {
+        if index < count {
+            f64::from_le_bytes(metadata[index * 8..(index + 1) * 8].try_into().unwrap())
+        } else {
+            0.0
+        }
+    });
     ensure!(
-        values.iter().all(|value| value.is_finite()),
+        values[..count].iter().all(|value| value.is_finite()),
         "non-finite quantized chunk metadata"
     );
     ensure!(values[count - 1] >= 0.0, "negative quantization step");
@@ -782,29 +1128,25 @@ fn codec_bits(codec_id: u32) -> u8 {
     }
 }
 
-fn decode_codes<T: Scalar>(
-    payload: &[u8],
-    bits: u8,
-    mut reconstruct: impl FnMut(usize, u64) -> f64,
-) -> Result<Vec<T>> {
-    let width = usize::from(bits / 8);
-    ensure!(
-        payload.len() == CHUNK_VOLUME * width,
-        "invalid quantized chunk length"
-    );
-    Ok(payload
-        .chunks_exact(width)
-        .enumerate()
-        .map(|(index, bytes)| {
-            let code = match bits {
-                8 => u64::from(bytes[0]),
-                16 => u64::from(u16::from_le_bytes(bytes.try_into().unwrap())),
-                32 => u64::from(u32::from_le_bytes(bytes.try_into().unwrap())),
-                _ => unreachable!(),
-            };
-            T::from_domain(reconstruct(index, code))
-        })
-        .collect())
+fn validate_payload<'a>(chunk: &ArchivedScalarChunkRecord, payloads: &'a [u8]) -> Result<&'a [u8]> {
+    let offset = usize::try_from(chunk.payload_offset.to_native())
+        .context("chunk payload offset exceeds usize")?;
+    let length = usize::try_from(chunk.payload_length.to_native())
+        .context("chunk payload length exceeds usize")?;
+    let end = offset
+        .checked_add(length)
+        .context("chunk payload range overflow")?;
+    payloads
+        .get(offset..end)
+        .context("chunk payload range is outside its block")
+}
+
+fn payload_code<const WIDTH: usize>(payload: &[u8], index: usize) -> u64 {
+    debug_assert!(matches!(WIDTH, 1 | 2 | 4 | 8));
+    let start = index * WIDTH;
+    let mut bytes = [0_u8; 8];
+    bytes[..WIDTH].copy_from_slice(&payload[start..start + WIDTH]);
+    u64::from_le_bytes(bytes)
 }
 
 fn present(mask: &[u64; MASK_WORDS], index: usize) -> bool {
@@ -891,36 +1233,46 @@ fn append_code(bytes: &mut Vec<u8>, bits: u8, code: u64) {
     }
 }
 
-fn pack_payload(bytes: &[u8]) -> Result<(u64, Vec<u64>)> {
-    let length = u64::try_from(bytes.len()).context("chunk payload length exceeds u64")?;
-    let mut words = Vec::with_capacity(bytes.len().div_ceil(8));
-    for chunk in bytes.chunks(8) {
-        let mut word = [0_u8; 8];
-        word[..chunk.len()].copy_from_slice(chunk);
-        words.push(u64::from_le_bytes(word));
-    }
-    Ok((length, words))
-}
-
-fn unpack_payload(words: &[u64], length: u64) -> Result<Vec<u8>> {
-    let length = usize::try_from(length).context("chunk payload length exceeds usize")?;
-    ensure!(
-        words.len() == length.div_ceil(8),
-        "invalid aligned chunk payload length"
-    );
-    let mut bytes = Vec::with_capacity(words.len() * 8);
-    for &word in words {
-        bytes.extend_from_slice(&word.to_le_bytes());
-    }
-    bytes.truncate(length);
-    Ok(bytes)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::archive::MsgErrorTolerance;
     use glam::UVec3;
+
+    fn decode_owned_f32(archive: EncodedScalarGrid) -> Result<SparseGrid3<f32>> {
+        let bounds = array_to_uvec3(archive.directory.bounds);
+        decode_owned_f32_with_bounds(archive, bounds)
+    }
+
+    fn decode_owned_f32_with_bounds(
+        archive: EncodedScalarGrid,
+        bounds: UVec3,
+    ) -> Result<SparseGrid3<f32>> {
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&archive.directory)?;
+        let archived = rkyv::access::<ArchivedScalarGridRecord, rkyv::rancor::Error>(&bytes)?;
+        decode_f32(
+            ArchivedScalarGridView {
+                directory: archived,
+                masks: &archive.masks,
+                payloads: &archive.payloads,
+            },
+            bounds,
+        )
+    }
+
+    fn decode_owned_f64(archive: EncodedScalarGrid) -> Result<SparseGrid3<f64>> {
+        let bounds = array_to_uvec3(archive.directory.bounds);
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&archive.directory)?;
+        let archived = rkyv::access::<ArchivedScalarGridRecord, rkyv::rancor::Error>(&bytes)?;
+        decode_f64(
+            ArchivedScalarGridView {
+                directory: archived,
+                masks: &archive.masks,
+                payloads: &archive.payloads,
+            },
+            bounds,
+        )
+    }
 
     fn auto_policy(max_abs_error: f64) -> ResolvedFieldCodec {
         ResolvedFieldCodec {
@@ -959,8 +1311,8 @@ mod tests {
         grid.write_aabb_values(grid.bounds_aabb(), &values)
             .map_err(|error| anyhow::anyhow!("writing test grid: {error:?}"))?;
         let archive = encode_f64(&grid, auto_policy(1.0e-10))?;
-        assert_eq!(archive.chunks[0].codec_id, CODEC_AFFINE_F64);
-        let decoded = decode_f64(archive)?;
+        assert_eq!(archive.directory.chunks[0].codec_id, CODEC_AFFINE_F64);
+        let decoded = decode_owned_f64(archive)?;
         for (expected, actual) in values.into_iter().zip((0..CHUNK_VOLUME).map(|index| {
             let [x, y, z] = coordinates(index);
             decoded
@@ -982,8 +1334,8 @@ mod tests {
         grid.write_aabb_values(grid.bounds_aabb(), &values)
             .map_err(|error| anyhow::anyhow!("writing test grid: {error:?}"))?;
         let archive = encode_f32(&grid, auto_policy(0.002))?;
-        assert_eq!(archive.chunks[0].codec_id, CODEC_QUANTIZED_U8);
-        let decoded = decode_f32(archive)?;
+        assert_eq!(archive.directory.chunks[0].codec_id, CODEC_QUANTIZED_U8);
+        let decoded = decode_owned_f32(archive)?;
         for (index, &expected) in values.iter().enumerate() {
             let [x, y, z] = coordinates(index);
             let actual = decoded
@@ -1008,7 +1360,7 @@ mod tests {
             &grid,
             forced_policy(MsgChunkCodec::QuantizedU16, Some(0.002)),
         )?;
-        assert_eq!(archive.chunks[0].codec_id, CODEC_QUANTIZED_U16);
+        assert_eq!(archive.directory.chunks[0].codec_id, CODEC_QUANTIZED_U16);
         Ok(())
     }
 
@@ -1041,7 +1393,7 @@ mod tests {
         assert!(grid.set(UVec3::ZERO, 42.0_f32));
 
         let archive = encode_f32(&grid, forced_policy(MsgChunkCodec::DenseF32, None))?;
-        assert_eq!(archive.chunks[0].codec_id, CODEC_UNIFORM);
+        assert_eq!(archive.directory.chunks[0].codec_id, CODEC_UNIFORM);
         Ok(())
     }
 
@@ -1055,8 +1407,8 @@ mod tests {
         grid.write_aabb_values(grid.bounds_aabb(), &values)
             .map_err(|error| anyhow::anyhow!("writing test grid: {error:?}"))?;
         let archive = encode_f64(&grid, auto_policy(0.0))?;
-        assert_eq!(archive.chunks[0].codec_id, CODEC_DENSE_F32);
-        let decoded = decode_f64(archive)?;
+        assert_eq!(archive.directory.chunks[0].codec_id, CODEC_DENSE_F32);
+        let decoded = decode_owned_f64(archive)?;
         for (index, &expected) in values.iter().enumerate() {
             let [x, y, z] = coordinates(index);
             assert_eq!(
@@ -1066,6 +1418,138 @@ mod tests {
                 expected
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn archived_packed_payloads_decode_for_every_width() -> Result<()> {
+        let bounds = UVec3::splat(CHUNK_SIZE);
+        let mut grid = SparseGrid3::new(bounds);
+        let values = (0..CHUNK_VOLUME)
+            .map(|index| {
+                let [x, y, z] = coordinates(index);
+                let noise = ((index * 7919) % 1000) as f64 / 5000.0;
+                10.0 + 1.25 * x - 0.5 * y + 0.125 * z + noise
+            })
+            .collect::<Vec<_>>();
+        grid.write_aabb_values(grid.bounds_aabb(), &values)
+            .map_err(|error| anyhow::anyhow!("writing test grid: {error:?}"))?;
+
+        let cases = [
+            (MsgChunkCodec::DenseF64, None, CODEC_DENSE_F64),
+            (MsgChunkCodec::QuantizedU8, Some(0.2), CODEC_QUANTIZED_U8),
+            (
+                MsgChunkCodec::QuantizedU16,
+                Some(0.001),
+                CODEC_QUANTIZED_U16,
+            ),
+            (
+                MsgChunkCodec::QuantizedU32,
+                Some(1.0e-7),
+                CODEC_QUANTIZED_U32,
+            ),
+            (
+                MsgChunkCodec::AffineResidualU8,
+                Some(0.001),
+                CODEC_AFFINE_RESIDUAL_U8,
+            ),
+            (
+                MsgChunkCodec::AffineResidualU16,
+                Some(1.0e-5),
+                CODEC_AFFINE_RESIDUAL_U16,
+            ),
+            (
+                MsgChunkCodec::AffineResidualU32,
+                Some(1.0e-9),
+                CODEC_AFFINE_RESIDUAL_U32,
+            ),
+        ];
+
+        for (codec, tolerance, expected_id) in cases {
+            let archive = encode_f64(&grid, forced_policy(codec, tolerance))?;
+            assert_eq!(archive.directory.chunks[0].codec_id, expected_id);
+            let decoded = decode_owned_f64(archive)?;
+            for (index, &expected) in values.iter().enumerate() {
+                let [x, y, z] = coordinates(index);
+                let actual = decoded
+                    .get(UVec3::new(x as u32, y as u32, z as u32))
+                    .unwrap();
+                match tolerance {
+                    Some(limit) => assert!((expected - actual).abs() <= limit),
+                    None => assert_eq!(actual, expected),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn archived_decoder_rejects_truncated_packed_payload() -> Result<()> {
+        let bounds = UVec3::splat(CHUNK_SIZE);
+        let mut grid = SparseGrid3::new(bounds);
+        let values = (0..CHUNK_VOLUME)
+            .map(|index| index as f32)
+            .collect::<Vec<_>>();
+        grid.write_aabb_values(grid.bounds_aabb(), &values)
+            .map_err(|error| anyhow::anyhow!("writing test grid: {error:?}"))?;
+        let mut archive = encode_f32(&grid, forced_policy(MsgChunkCodec::DenseF32, None))?;
+        archive.payloads.pop();
+
+        let error = decode_owned_f32(archive).unwrap_err();
+        assert!(error.to_string().contains("outside its block"));
+        Ok(())
+    }
+
+    #[test]
+    fn archived_decoder_rejects_non_finite_present_values() -> Result<()> {
+        let bounds = UVec3::splat(CHUNK_SIZE);
+        let mut grid = SparseGrid3::new(bounds);
+        let values = (0..CHUNK_VOLUME)
+            .map(|index| index as f32)
+            .collect::<Vec<_>>();
+        grid.write_aabb_values(grid.bounds_aabb(), &values)
+            .map_err(|error| anyhow::anyhow!("writing test grid: {error:?}"))?;
+        let mut archive = encode_f32(&grid, forced_policy(MsgChunkCodec::DenseF32, None))?;
+        archive.payloads[..4].copy_from_slice(&f32::NAN.to_le_bytes());
+
+        let error = decode_owned_f32(archive).unwrap_err();
+        assert!(error.to_string().contains("non-finite present value"));
+        Ok(())
+    }
+
+    #[test]
+    fn archived_decoder_validates_grid_and_chunk_topology() -> Result<()> {
+        let bounds = UVec3::new(CHUNK_SIZE * 2, CHUNK_SIZE, CHUNK_SIZE);
+        let mut grid = SparseGrid3::new(bounds);
+        let values = (0..CHUNK_VOLUME * 2)
+            .map(|index| index as f32)
+            .collect::<Vec<_>>();
+        grid.write_aabb_values(grid.bounds_aabb(), &values)
+            .map_err(|error| anyhow::anyhow!("writing test grid: {error:?}"))?;
+
+        let archive = encode_f32(&grid, forced_policy(MsgChunkCodec::DenseF32, None))?;
+        let error = decode_owned_f32_with_bounds(archive, bounds + UVec3::X).unwrap_err();
+        assert!(error.to_string().contains("bounds do not match"));
+
+        let mut archive = encode_f32(&grid, forced_policy(MsgChunkCodec::DenseF32, None))?;
+        archive.directory.chunks[1].key = archive.directory.chunks[0].key;
+        let error = decode_owned_f32(archive).unwrap_err();
+        assert!(error.to_string().contains("not unique and sorted"));
+
+        let edge_bounds = UVec3::new(CHUNK_SIZE - 1, 1, 1);
+        let mut edge_grid = SparseGrid3::new(edge_bounds);
+        let edge_values = (0..CHUNK_SIZE - 1)
+            .map(|index| index as f32)
+            .collect::<Vec<_>>();
+        edge_grid
+            .write_aabb_values(edge_grid.bounds_aabb(), &edge_values)
+            .map_err(|error| anyhow::anyhow!("writing edge test grid: {error:?}"))?;
+        let mut archive = encode_f32(&edge_grid, forced_policy(MsgChunkCodec::DenseF32, None))?;
+        let word =
+            u64::from_le_bytes(archive.masks[..8].try_into().unwrap()) | 1_u64 << (CHUNK_SIZE - 1);
+        archive.masks[..8].copy_from_slice(&word.to_le_bytes());
+        let error = decode_owned_f32(archive).unwrap_err();
+        assert!(error.to_string().contains("outside grid bounds"));
         Ok(())
     }
 
@@ -1090,12 +1574,30 @@ mod tests {
         )?;
         assert_eq!(
             archive
+                .directory
                 .chunks
                 .iter()
                 .map(|chunk| chunk.key)
                 .collect::<Vec<_>>(),
             vec![[0, 0, 0], [1, 0, 0], [2, 0, 0]]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn full_masks_are_tags_and_irregular_masks_use_one_raw_mask() -> Result<()> {
+        let bounds = UVec3::splat(CHUNK_SIZE);
+        let mut full = SparseGrid3::new(bounds);
+        full.fill_aabb(full.bounds_aabb(), 1.0_f32);
+        let encoded = encode_f32(&full, forced_policy(MsgChunkCodec::DenseF32, None))?;
+        assert_eq!(encoded.directory.chunks[0].mask_kind, MASK_FULL);
+        assert!(encoded.masks.is_empty());
+
+        let mut irregular = SparseGrid3::new(bounds);
+        irregular.set(UVec3::ZERO, 1.0_f32);
+        let encoded = encode_f32(&irregular, forced_policy(MsgChunkCodec::DenseF32, None))?;
+        assert_eq!(encoded.directory.chunks[0].mask_kind, MASK_DENSE);
+        assert_eq!(encoded.masks.len(), MASK_WORDS * 8);
         Ok(())
     }
 }

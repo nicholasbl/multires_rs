@@ -347,43 +347,84 @@ where
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct BitMask {
-    words: [u64; MASK_WORDS],
+pub(super) enum BitMask {
+    Uniform(bool),
+    Dense(Box<[u64; MASK_WORDS]>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BitMaskView<'a> {
+    Uniform(bool),
+    Dense(&'a [u64; MASK_WORDS]),
+}
+
+static EMPTY_MASK_WORDS: [u64; MASK_WORDS] = [0; MASK_WORDS];
+static FULL_MASK_WORDS: [u64; MASK_WORDS] = [u64::MAX; MASK_WORDS];
+
+impl BitMaskView<'_> {
+    #[inline]
+    pub(crate) fn as_words(&self) -> &[u64; MASK_WORDS] {
+        match self {
+            Self::Uniform(false) => &EMPTY_MASK_WORDS,
+            Self::Uniform(true) => &FULL_MASK_WORDS,
+            Self::Dense(words) => words,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn is_full(&self) -> bool {
+        match self {
+            Self::Uniform(value) => *value,
+            Self::Dense(words) => words.iter().all(|&word| word == u64::MAX),
+        }
+    }
 }
 
 impl BitMask {
     #[inline]
-    pub(super) fn words(&self) -> [u64; MASK_WORDS] {
-        self.words
+    pub(super) fn view(&self) -> BitMaskView<'_> {
+        match self {
+            Self::Uniform(value) => BitMaskView::Uniform(*value),
+            Self::Dense(words) => BitMaskView::Dense(words),
+        }
     }
 
     #[inline]
     pub(super) fn from_words(words: [u64; MASK_WORDS]) -> Self {
-        Self { words }
+        if words.iter().all(|&word| word == 0) {
+            Self::Uniform(false)
+        } else if words.iter().all(|&word| word == u64::MAX) {
+            Self::Uniform(true)
+        } else {
+            Self::Dense(Box::new(words))
+        }
     }
 
     #[inline]
     pub(super) fn empty() -> Self {
-        Self {
-            words: [0; MASK_WORDS],
-        }
+        Self::Uniform(false)
     }
 
     #[inline]
     pub(super) fn full() -> Self {
-        Self {
-            words: [u64::MAX; MASK_WORDS],
-        }
+        Self::Uniform(true)
     }
 
     #[inline]
     pub(super) fn is_empty(&self) -> bool {
-        self.words.iter().all(|&w| w == 0)
+        match self {
+            Self::Uniform(value) => !*value,
+            Self::Dense(words) => words.iter().all(|&word| word == 0),
+        }
     }
 
     #[inline]
     pub(super) fn count_ones(&self) -> usize {
-        self.words.iter().map(|w| w.count_ones() as usize).sum()
+        match self {
+            Self::Uniform(false) => 0,
+            Self::Uniform(true) => CHUNK_VOLUME,
+            Self::Dense(words) => words.iter().map(|w| w.count_ones() as usize).sum(),
+        }
     }
 
     #[inline]
@@ -391,7 +432,10 @@ impl BitMask {
         debug_assert!(idx < CHUNK_VOLUME);
         let word = idx / MASK_WORD_BITS;
         let bit = idx % MASK_WORD_BITS;
-        (self.words[word] & (1u64 << bit)) != 0
+        match self {
+            Self::Uniform(value) => *value,
+            Self::Dense(words) => (words[word] & (1u64 << bit)) != 0,
+        }
     }
 
     #[inline]
@@ -399,7 +443,17 @@ impl BitMask {
         debug_assert!(idx < CHUNK_VOLUME);
         let word = idx / MASK_WORD_BITS;
         let bit = idx % MASK_WORD_BITS;
-        self.words[word] |= 1u64 << bit;
+        match self {
+            Self::Uniform(true) => {}
+            Self::Uniform(false) => {
+                let mut words = Box::new([0; MASK_WORDS]);
+                words[word] |= 1u64 << bit;
+                *self = Self::Dense(words);
+            }
+            Self::Dense(words) => {
+                words[word] |= 1u64 << bit;
+            }
+        }
     }
 
     /// Clears `idx`. Returns true if it was previously set.
@@ -408,17 +462,28 @@ impl BitMask {
         debug_assert!(idx < CHUNK_VOLUME);
         let word = idx / MASK_WORD_BITS;
         let bit = idx % MASK_WORD_BITS;
-        let mask = 1u64 << bit;
-        let was_set = (self.words[word] & mask) != 0;
-        self.words[word] &= !mask;
-        was_set
+        let bit_mask = 1u64 << bit;
+        match self {
+            Self::Uniform(false) => false,
+            Self::Uniform(true) => {
+                let mut words = Box::new([u64::MAX; MASK_WORDS]);
+                words[word] &= !bit_mask;
+                *self = Self::Dense(words);
+                true
+            }
+            Self::Dense(words) => {
+                let was_set = (words[word] & bit_mask) != 0;
+                words[word] &= !bit_mask;
+                was_set
+            }
+        }
     }
 
     pub(super) fn set_aabb(&mut self, local_min: UVec3, local_max: UVec3) {
         debug_assert!(valid_local_aabb(local_min, local_max));
 
         if is_full_chunk_local_aabb(local_min, local_max) {
-            self.words.fill(u64::MAX);
+            *self = Self::Uniform(true);
             return;
         }
 
@@ -435,7 +500,7 @@ impl BitMask {
         debug_assert!(valid_local_aabb(local_min, local_max));
 
         if is_full_chunk_local_aabb(local_min, local_max) {
-            self.words.fill(0);
+            *self = Self::Uniform(false);
             return;
         }
 
@@ -485,7 +550,7 @@ impl BitMask {
     }
 
     pub(super) fn first_set_index(&self) -> Option<usize> {
-        for (word_i, &word) in self.words.iter().enumerate() {
+        for (word_i, &word) in self.view().as_words().iter().enumerate() {
             if word != 0 {
                 return Some(word_i * MASK_WORD_BITS + word.trailing_zeros() as usize);
             }
@@ -497,7 +562,7 @@ impl BitMask {
     where
         F: FnMut(usize),
     {
-        for (word_i, &word) in self.words.iter().enumerate() {
+        for (word_i, &word) in self.view().as_words().iter().enumerate() {
             let mut bits = word;
             while bits != 0 {
                 let bit = bits.trailing_zeros() as usize;

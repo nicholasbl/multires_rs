@@ -109,7 +109,7 @@ impl Mc33Mesher<'_> {
         for (index, (&corner, value)) in corners.iter().zip(&mut values).enumerate() {
             *value = self
                 .samples
-                .get(corner)
+                .get(corner)?
                 .with_context(|| format!("surface sample is absent at {corner:?}"))?
                 - self.isovalue;
             if *value > 0.0 {
@@ -288,7 +288,7 @@ pub(super) fn mesh_level_aabb(
     let mut error = None;
     level
         .active_cubes
-        .for_each_present_in_aabb(active_aabb, |anchor, ()| {
+        .for_each_present_in_aabb(active_aabb, |anchor| {
             if error.is_none() {
                 error = mesher.march_cube(anchor).err();
             }
