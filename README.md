@@ -3,7 +3,8 @@
 `multires_rs` is an implementation of multiresolution sparse grids
 (MSG (I was hungry when I wrote this)), including the
 `.msg` archive format, and algorithms that operate on MSG data. Source-format importers such as
-`amrex_rs` and `msg_vti` depend on this crate.
+`msg_amrex` and `msg_vti` depend on this crate; `msg_convert` provides their
+shared command-line conversion interface.
 
 An MSG file currently contains one timestep. Levels are ordered coarse to fine,
 all fields are finite scalar point data, and every field has its own unique sparse
